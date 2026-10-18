@@ -76,6 +76,14 @@ export class EnvironmentVariables {
   RETRY_BACKOFF_MS: number = 2000;
 
   @IsInt()
+  @Min(1)
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: number = 5;
+
+  @IsInt()
+  @Min(100)
+  CIRCUIT_BREAKER_COOLDOWN_MS: number = 10000;
+
+  @IsInt()
   @Min(100)
   OUTBOX_RELAY_INTERVAL_MS: number = 5000;
 

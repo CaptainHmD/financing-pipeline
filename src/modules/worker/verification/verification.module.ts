@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ApplicationsDataModule } from '../../../shared/applications/applications-data.module';
+import { CircuitBreakerRegistry } from './gateways/circuit-breaker';
 import { CrRegistryGateway } from './gateways/cr-registry.gateway';
 import { CreditBureauGateway } from './gateways/credit-bureau.gateway';
 import { VERIFICATION_GATEWAYS } from './gateways/gateway.types';
@@ -12,6 +13,7 @@ import { VerificationService } from './verification.service';
 @Module({
   imports: [ApplicationsDataModule],
   providers: [
+    CircuitBreakerRegistry,
     HttpGatewayClient,
     IdentityGateway,
     CrRegistryGateway,

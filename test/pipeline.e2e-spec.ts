@@ -279,4 +279,38 @@ describe('Verification pipeline (e2e)', () => {
       await channel.purgeQueue(DEAD_LETTER_QUEUE);
     });
   });
+
+  // Kept last: it opens the SIMAH circuit (threshold 4, cooldown 1 s in e2e-env.ts).
+  describe('circuit breaker', () => {
+    it('fails fast while SIMAH is down, then recovers after the cooldown', async () => {
+      const submitted = await Promise.all(
+        [1, 2, 3].map(() =>
+          submit(h, { ...identifiers({ simah: '3' }), requestedAmount: 250_000 }).expect(202),
+        ),
+      );
+      const ids = submitted.map((res) => res.body.id as string);
+      await Promise.all(ids.map((id) => waitForDecision(h, id)));
+
+      // Every application still gets a safe decision...
+      for (const id of ids) {
+        const { body } = await get(id);
+        expect(body.decision).toBe(REVIEW);
+        expect(body.decisionReasons).toEqual(['CREDIT_UNAVAILABLE']);
+      }
+      // ...and after 4 consecutive 503s the remaining attempts never reached SIMAH.
+      const shortCircuited = await h.prisma.auditEvent.count({
+        where: {
+          applicationId: { in: ids },
+          metadata: { path: ['error'], equals: 'CIRCUIT_OPEN' },
+        },
+      });
+      expect(shortCircuited).toBeGreaterThan(0);
+
+      // After the cooldown, a trial call succeeds and the circuit closes again.
+      await sleep(1100);
+      const { body } = await submit(h, { ...identifiers(), requestedAmount: 250_000 }).expect(202);
+      await waitForDecision(h, body.id);
+      expect((await get(body.id)).body.decision).toBe(APPROVED);
+    });
+  });
 });

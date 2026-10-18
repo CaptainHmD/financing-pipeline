@@ -27,6 +27,8 @@ export const E2E_ENV: Record<string, string> = {
   // 3 attempts is exactly what the "503 twice, then OK" scenarios need.
   RETRY_ATTEMPTS: '3',
   RETRY_BACKOFF_MS: '100',
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: '4',
+  CIRCUIT_BREAKER_COOLDOWN_MS: '1000',
   OUTBOX_RELAY_INTERVAL_MS: '200',
   OUTBOX_RELAY_AFTER_MS: '500',
 };
