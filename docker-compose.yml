@@ -1,0 +1,76 @@
+name: app
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U app -d app']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    # Fixed hostname: RabbitMQ keeps its data per node name, which defaults to the hostname
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: app
+    ports:
+      - '5672:5672'
+      - '15672:15672' # management UI: http://localhost:15672 (app / app)
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      # Run as the rabbitmq user: as root, the CLI would create a root-owned Erlang cookie
+      # before the server starts and the server could no longer read it.
+      test: ['CMD', 'su-exec', 'rabbitmq', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      PORT: 3001
+      DATABASE_URL: postgresql://app:app@postgres:5432/app?schema=public
+      RABBITMQ_URL: amqp://app:app@rabbitmq:5672
+      GATEWAY_BASE_URL: http://api:3001/mock
+    command: ['sh', '-c', 'npx prisma migrate deploy && node dist/apps/api/main.js']
+    ports:
+      - '3001:3001'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:3001/health || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://app:app@postgres:5432/app?schema=public
+      RABBITMQ_URL: amqp://app:app@rabbitmq:5672
+      GATEWAY_BASE_URL: http://api:3001/mock
+    command: ['node', 'dist/apps/worker/main.js']
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  rabbitmqdata:

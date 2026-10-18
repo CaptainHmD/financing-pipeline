@@ -1,0 +1,3022 @@
+{
+  "info": {
+    "name": "Financing API",
+    "description": "Requests for the financing application pipeline.\n\n1. Start the stack (`docker compose up`) and import the \"Financing API - Local\" environment, or keep the collection defaults.\n2. Send any request: a bearer token is fetched automatically with the demo client credentials.\n3. \"Applications\" walks through submit → idempotent replay → status → audit trail.\n4. \"Verification scenarios\" covers every mocked gateway behaviour and checks the decision; run the folder with the Collection Runner.\n\nScenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last digit of nationalId, Wathiq = last digit of crNumber. See GET /mock/scenarios.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{accessToken}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Fetches a bearer token automatically when there is none or it is about to expire.",
+          "// Requests under Health, Auth and Mock gateways do not need one.",
+          "const firstSegment = pm.request.url.path && pm.request.url.path[0];",
+          "const isPublic = ['health', 'docs', 'auth', 'mock'].includes(firstSegment);",
+          "const token = pm.collectionVariables.get('accessToken');",
+          "const expiresAt = Number(pm.collectionVariables.get('accessTokenExpiresAt') || 0);",
+          "",
+          "if (!isPublic && !(token && Date.now() < expiresAt)) pm.sendRequest(",
+          "  {",
+          "    url: pm.variables.replaceIn('{{baseUrl}}/auth/token'),",
+          "    method: 'POST',",
+          "    header: { 'Content-Type': 'application/json' },",
+          "    body: {",
+          "      mode: 'raw',",
+          "      raw: JSON.stringify({",
+          "        clientId: pm.variables.get('clientId'),",
+          "        clientSecret: pm.variables.get('clientSecret'),",
+          "      }),",
+          "    },",
+          "  },",
+          "  (err, res) => {",
+          "    if (err || res.code !== 200) {",
+          "      console.error('Could not obtain an access token', err || res.text());",
+          "      return;",
+          "    }",
+          "    const { accessToken, expiresIn } = res.json();",
+          "    pm.collectionVariables.set('accessToken', accessToken);",
+          "    pm.collectionVariables.set('accessTokenExpiresAt', Date.now() + (expiresIn - 30) * 1000);",
+          "  },",
+          ");"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.test('Response is not a server error', () => pm.expect(pm.response.code).to.be.below(500));"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3001"
+    },
+    {
+      "key": "clientId",
+      "value": "demo-client"
+    },
+    {
+      "key": "clientSecret",
+      "value": "demo-client-secret"
+    },
+    {
+      "key": "pollTimeoutMs",
+      "value": "120000"
+    },
+    {
+      "key": "accessToken",
+      "value": ""
+    },
+    {
+      "key": "accessTokenExpiresAt",
+      "value": ""
+    },
+    {
+      "key": "applicationId",
+      "value": ""
+    },
+    {
+      "key": "idempotencyKey",
+      "value": ""
+    },
+    {
+      "key": "nationalId",
+      "value": ""
+    },
+    {
+      "key": "crNumber",
+      "value": ""
+    },
+    {
+      "key": "requestedAmount",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "Health & docs",
+      "description": "Liveness probe and the generated OpenAPI document. No token needed.",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('status is ok', () => pm.expect(pm.response.json().status).to.eql('ok'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "OpenAPI document",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/docs/openapi.json",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "docs",
+                "openapi.json"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "description": "Swagger UI is served at {{baseUrl}}/docs."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Exposes the applications endpoints', () => {",
+                  "  const paths = Object.keys(pm.response.json().paths);",
+                  "  pm.expect(paths).to.include('/applications');",
+                  "  pm.expect(paths).to.include('/applications/{id}');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "description": "Demo client-credentials flow. The collection fetches a token by itself before any protected request, so calling \"Issue access token\" by hand is optional. Limited to 10 requests per minute.",
+      "item": [
+        {
+          "name": "Issue access token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clientId\": \"{{clientId}}\",\n  \"clientSecret\": \"{{clientSecret}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Returns a bearer token', () => {",
+                  "  pm.expect(body.tokenType).to.eql('Bearer');",
+                  "  pm.expect(body.accessToken).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.expiresIn).to.be.above(0);",
+                  "});",
+                  "pm.collectionVariables.set('accessToken', body.accessToken);",
+                  "pm.collectionVariables.set('accessTokenExpiresAt', Date.now() + (body.expiresIn - 30) * 1000);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Wrong client secret → 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clientId\": \"{{clientId}}\",\n  \"clientSecret\": \"not-the-secret\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));",
+                  "pm.test('No token in the response', () => pm.expect(pm.response.json()).to.not.have.property('accessToken'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Missing fields → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clientId\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Applications",
+      "description": "Submit an application, replay it safely with the same Idempotency-Key, and read its status and audit trail. Run the requests in order: later ones reuse the id and key saved by \"Submit application\".",
+      "item": [
+        {
+          "name": "Submit application",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/applications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Returns 202 straight away; the checks run in the background. The pre-request script generates fresh happy-path identifiers and a new Idempotency-Key, and saves them for the next requests."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                  "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                  "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                  "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '0');",
+                  "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                  "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                  "pm.variables.set('requestedAmount', 250000);",
+                  "for (const key of ['nationalId', 'crNumber', 'idempotencyKey', 'requestedAmount']) {",
+                  "  pm.collectionVariables.set(key, pm.variables.get(key));",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                  "const body = pm.response.json();",
+                  "pm.test('Pipeline started', () => pm.expect(body.status).to.be.oneOf(['submitted', 'verifying']));",
+                  "pm.test('No decision yet', () => pm.expect(body.decision).to.be.null);",
+                  "pm.test('Location header points to the application', () =>",
+                  "  pm.expect(pm.response.headers.get('Location')).to.eql('/applications/' + body.id));",
+                  "pm.test('PII is masked', () => {",
+                  "  pm.expect(body.nationalId).to.match(/^\\d\\*+\\d{2}$/);",
+                  "  pm.expect(body.crNumber).to.match(/^\\d\\*+\\d{2}$/);",
+                  "});",
+                  "pm.test('Three checks were created', () => pm.expect(body.checks).to.have.lengthOf(3));",
+                  "pm.collectionVariables.set('applicationId', body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Replay with same Idempotency-Key",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/applications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Same key and same payload: returns the original application instead of creating a second one."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                  "pm.test('Marked as a replay', () => pm.expect(pm.response.headers.get('Idempotent-Replayed')).to.eql('true'));",
+                  "pm.test('Same application id', () =>",
+                  "  pm.expect(pm.response.json().id).to.eql(pm.collectionVariables.get('applicationId')));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Same Idempotency-Key, different payload → 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/applications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": 999999\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict', () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get application",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/applications/{{applicationId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications",
+                "{{applicationId}}"
+              ]
+            },
+            "description": "Current status, decision and per-check results. Status moves submitted → verifying → decided; send it again after a few seconds to see the decision."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Same application', () => pm.expect(body.id).to.eql(pm.collectionVariables.get('applicationId')));",
+                  "pm.test('Known status', () => pm.expect(body.status).to.be.oneOf(['submitted', 'verifying', 'decided']));",
+                  "pm.test('Checks for identity, CR and credit', () =>",
+                  "  pm.expect(body.checks.map((c) => c.type).sort()).to.eql(['commercial_registration', 'credit', 'identity']));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get audit events",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/applications/{{applicationId}}/events",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications",
+                "{{applicationId}}",
+                "events"
+              ]
+            },
+            "description": "Audit trail: submission, enqueueing, retries, check outcomes and the decision."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const events = pm.response.json();",
+                  "pm.test('Starts with APPLICATION_SUBMITTED', () => pm.expect(events[0].event).to.eql('APPLICATION_SUBMITTED'));",
+                  "pm.test('Events contain no raw identifiers', () => {",
+                  "  const raw = JSON.stringify(events);",
+                  "  pm.expect(raw).to.not.include(pm.collectionVariables.get('nationalId'));",
+                  "  pm.expect(raw).to.not.include(pm.collectionVariables.get('crNumber'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Error handling",
+      "description": "Validation, authentication and lookup errors.",
+      "item": [
+        {
+          "name": "No bearer token → 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/applications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                  "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                  "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                  "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '0');",
+                  "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                  "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                  "pm.variables.set('requestedAmount', 250000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Invalid bearer token → 401",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/applications/{{$guid}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications",
+                "{{$guid}}"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "not-a-real-token",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Missing Idempotency-Key → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/applications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                  "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                  "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                  "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '0');",
+                  "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                  "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                  "pm.variables.set('requestedAmount', 250000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "pm.test('Explains the missing header', () => pm.expect(pm.response.json().message).to.include('Idempotency-Key'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Invalid payload → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/applications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nationalId\": \"3123\",\n  \"crNumber\": \"abc\",\n  \"requestedAmount\": 500,\n  \"unexpectedField\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "nationalId must be 10 digits starting with 1 or 2, crNumber 10 digits, requestedAmount between 10,000 and 5,000,000 SAR. Unknown fields are rejected."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "const messages = pm.response.json().message.join(' | ');",
+                  "pm.test('Reports every invalid field', () => {",
+                  "  for (const field of ['nationalId', 'crNumber', 'requestedAmount', 'unexpectedField']) {",
+                  "    pm.expect(messages).to.include(field);",
+                  "  }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Application already in progress → 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/applications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "The pre-request script submits an application whose CR check hangs (CR ends in 3), then this request submits the same National ID and CR with a new Idempotency-Key while the first is still open."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                  "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                  "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                  "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '0');",
+                  "pm.variables.set('crNumber', '7' + rnd(8) + '3');",
+                  "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                  "pm.variables.set('requestedAmount', 250000);",
+                  "pm.sendRequest({",
+                  "  url: pm.variables.replaceIn('{{baseUrl}}/applications'),",
+                  "  method: 'POST',",
+                  "  header: {",
+                  "    'Content-Type': 'application/json',",
+                  "    Authorization: 'Bearer ' + pm.collectionVariables.get('accessToken'),",
+                  "    'Idempotency-Key': pm.variables.replaceIn('{{$guid}}'),",
+                  "  },",
+                  "  body: { mode: 'raw', raw: pm.variables.replaceIn(\"{\\n  \\\"nationalId\\\": \\\"{{nationalId}}\\\",\\n  \\\"crNumber\\\": \\\"{{crNumber}}\\\",\\n  \\\"requestedAmount\\\": {{requestedAmount}}\\n}\") },",
+                  "}, (err, res) => {",
+                  "  if (err || res.code !== 202) console.error('Setup submission failed', err || res.text());",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict', () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Malformed application id → 400",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/applications/not-a-uuid",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications",
+                "not-a-uuid"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Unknown application → 404",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/applications/{{$guid}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "applications",
+                "{{$guid}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Verification scenarios",
+      "description": "Each scenario submits an application whose identifiers trigger a mock gateway behaviour (see GET /mock/scenarios), then \"Result\" waits for the decision and checks it. Scenarios that exhaust retries take 30-60 seconds.",
+      "item": [
+        {
+          "name": "Happy path",
+          "description": "No magic digits. Expected: approved_for_risk_assessment (ALL_CHECKS_PASSED).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_happy_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_happy_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_happy_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is approved_for_risk_assessment', () => pm.expect(body.decision).to.eql('approved_for_risk_assessment'));",
+                      "pm.test('Reasons: ALL_CHECKS_PASSED', () => pm.expect(body.decisionReasons).to.have.members([\"ALL_CHECKS_PASSED\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Nafath flaky (503 twice, then verified)",
+          "description": "nationalId ends in 2 (Nafath). Expected: approved_for_risk_assessment (ALL_CHECKS_PASSED).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '2');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_nafath_flaky_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_nafath_flaky_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_nafath_flaky_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is approved_for_risk_assessment', () => pm.expect(body.decision).to.eql('approved_for_risk_assessment'));",
+                      "pm.test('Reasons: ALL_CHECKS_PASSED', () => pm.expect(body.decisionReasons).to.have.members([\"ALL_CHECKS_PASSED\"]));",
+                      "const check = body.checks.find((c) => c.type === 'identity');",
+                      "pm.test('identity check is verified', () => pm.expect(check.status).to.eql('verified'));",
+                      "pm.test('identity needed 3 attempts', () => pm.expect(check.attempts).to.eql(3));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Nafath identity not verified",
+          "description": "nationalId ends in 1 (Nafath). Expected: rejected (IDENTITY_NOT_VERIFIED).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '1');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_nafath_not_verified_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_nafath_not_verified_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_nafath_not_verified_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is rejected', () => pm.expect(body.decision).to.eql('rejected'));",
+                      "pm.test('Reasons: IDENTITY_NOT_VERIFIED', () => pm.expect(body.decisionReasons).to.have.members([\"IDENTITY_NOT_VERIFIED\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Nafath pending confirmation (ambiguous)",
+          "description": "nationalId ends in 3 (Nafath). Expected: requires_manual_compliance_review (IDENTITY_STATUS_INCONCLUSIVE).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '3');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_nafath_ambiguous_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_nafath_ambiguous_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_nafath_ambiguous_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is requires_manual_compliance_review', () => pm.expect(body.decision).to.eql('requires_manual_compliance_review'));",
+                      "pm.test('Reasons: IDENTITY_STATUS_INCONCLUSIVE', () => pm.expect(body.decisionReasons).to.have.members([\"IDENTITY_STATUS_INCONCLUSIVE\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Nafath down (retries exhausted)",
+          "description": "nationalId ends in 4 (Nafath). Expected: requires_manual_compliance_review (IDENTITY_UNAVAILABLE).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '4');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_nafath_down_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_nafath_down_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_nafath_down_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is requires_manual_compliance_review', () => pm.expect(body.decision).to.eql('requires_manual_compliance_review'));",
+                      "pm.test('Reasons: IDENTITY_UNAVAILABLE', () => pm.expect(body.decisionReasons).to.have.members([\"IDENTITY_UNAVAILABLE\"]));",
+                      "const check = body.checks.find((c) => c.type === 'identity');",
+                      "pm.test('identity check is unavailable', () => pm.expect(check.status).to.eql('unavailable'));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Wathiq CR expired",
+          "description": "crNumber ends in 1 (Wathiq). Expected: rejected (CR_EXPIRED).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '1');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_wathiq_expired_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_wathiq_expired_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_wathiq_expired_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is rejected', () => pm.expect(body.decision).to.eql('rejected'));",
+                      "pm.test('Reasons: CR_EXPIRED', () => pm.expect(body.decisionReasons).to.have.members([\"CR_EXPIRED\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Wathiq slow (first call times out)",
+          "description": "crNumber ends in 2 (Wathiq). Expected: approved_for_risk_assessment (ALL_CHECKS_PASSED).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '2');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_wathiq_slow_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_wathiq_slow_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_wathiq_slow_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is approved_for_risk_assessment', () => pm.expect(body.decision).to.eql('approved_for_risk_assessment'));",
+                      "pm.test('Reasons: ALL_CHECKS_PASSED', () => pm.expect(body.decisionReasons).to.have.members([\"ALL_CHECKS_PASSED\"]));",
+                      "const check = body.checks.find((c) => c.type === 'commercial_registration');",
+                      "pm.test('commercial_registration check is verified', () => pm.expect(check.status).to.eql('verified'));",
+                      "pm.test('commercial_registration needed 2 attempts', () => pm.expect(check.attempts).to.eql(2));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Wathiq hanging (every call times out)",
+          "description": "crNumber ends in 3 (Wathiq). Expected: requires_manual_compliance_review (CR_UNAVAILABLE).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '3');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_wathiq_hanging_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_wathiq_hanging_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_wathiq_hanging_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is requires_manual_compliance_review', () => pm.expect(body.decision).to.eql('requires_manual_compliance_review'));",
+                      "pm.test('Reasons: CR_UNAVAILABLE', () => pm.expect(body.decisionReasons).to.have.members([\"CR_UNAVAILABLE\"]));",
+                      "const check = body.checks.find((c) => c.type === 'commercial_registration');",
+                      "pm.test('commercial_registration check is unavailable', () => pm.expect(check.status).to.eql('unavailable'));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Wathiq CR not found (404)",
+          "description": "crNumber ends in 4 (Wathiq). Expected: rejected (CR_NOT_FOUND).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '4');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_wathiq_not_found_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_wathiq_not_found_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_wathiq_not_found_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is rejected', () => pm.expect(body.decision).to.eql('rejected'));",
+                      "pm.test('Reasons: CR_NOT_FOUND', () => pm.expect(body.decisionReasons).to.have.members([\"CR_NOT_FOUND\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Wathiq malformed response (HTML page)",
+          "description": "crNumber ends in 5 (Wathiq). Expected: requires_manual_compliance_review (CR_UNEXPECTED_RESPONSE).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '5');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_wathiq_malformed_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_wathiq_malformed_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_wathiq_malformed_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is requires_manual_compliance_review', () => pm.expect(body.decision).to.eql('requires_manual_compliance_review'));",
+                      "pm.test('Reasons: CR_UNEXPECTED_RESPONSE', () => pm.expect(body.decisionReasons).to.have.members([\"CR_UNEXPECTED_RESPONSE\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "SIMAH poor score (480)",
+          "description": "second-to-last nationalId digit 1 (SIMAH). Expected: rejected (CREDIT_SCORE_BELOW_MINIMUM).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '1' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_simah_poor_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_simah_poor_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_simah_poor_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is rejected', () => pm.expect(body.decision).to.eql('rejected'));",
+                      "pm.test('Reasons: CREDIT_SCORE_BELOW_MINIMUM', () => pm.expect(body.decisionReasons).to.have.members([\"CREDIT_SCORE_BELOW_MINIMUM\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "SIMAH flaky (503 twice, then 720)",
+          "description": "second-to-last nationalId digit 2 (SIMAH). Expected: approved_for_risk_assessment (ALL_CHECKS_PASSED).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '2' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_simah_flaky_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_simah_flaky_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_simah_flaky_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is approved_for_risk_assessment', () => pm.expect(body.decision).to.eql('approved_for_risk_assessment'));",
+                      "pm.test('Reasons: ALL_CHECKS_PASSED', () => pm.expect(body.decisionReasons).to.have.members([\"ALL_CHECKS_PASSED\"]));",
+                      "const check = body.checks.find((c) => c.type === 'credit');",
+                      "pm.test('credit check is verified', () => pm.expect(check.status).to.eql('verified'));",
+                      "pm.test('credit needed 3 attempts', () => pm.expect(check.attempts).to.eql(3));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "SIMAH down (retries exhausted)",
+          "description": "second-to-last nationalId digit 3 (SIMAH). Expected: requires_manual_compliance_review (CREDIT_UNAVAILABLE).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '3' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_simah_down_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_simah_down_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_simah_down_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is requires_manual_compliance_review', () => pm.expect(body.decision).to.eql('requires_manual_compliance_review'));",
+                      "pm.test('Reasons: CREDIT_UNAVAILABLE', () => pm.expect(body.decisionReasons).to.have.members([\"CREDIT_UNAVAILABLE\"]));",
+                      "const check = body.checks.find((c) => c.type === 'credit');",
+                      "pm.test('credit check is unavailable', () => pm.expect(check.status).to.eql('unavailable'));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "SIMAH borderline score (600)",
+          "description": "second-to-last nationalId digit 4 (SIMAH). Expected: requires_manual_compliance_review (CREDIT_SCORE_BORDERLINE).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '4' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_simah_borderline_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_simah_borderline_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_simah_borderline_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is requires_manual_compliance_review', () => pm.expect(body.decision).to.eql('requires_manual_compliance_review'));",
+                      "pm.test('Reasons: CREDIT_SCORE_BORDERLINE', () => pm.expect(body.decisionReasons).to.have.members([\"CREDIT_SCORE_BORDERLINE\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "SIMAH active defaults",
+          "description": "second-to-last nationalId digit 5 (SIMAH). Expected: rejected (CREDIT_ACTIVE_DEFAULTS).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '5' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_simah_defaults_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_simah_defaults_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_simah_defaults_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is rejected', () => pm.expect(body.decision).to.eql('rejected'));",
+                      "pm.test('Reasons: CREDIT_ACTIVE_DEFAULTS', () => pm.expect(body.decisionReasons).to.have.members([\"CREDIT_ACTIVE_DEFAULTS\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "SIMAH no credit file",
+          "description": "second-to-last nationalId digit 6 (SIMAH). Expected: requires_manual_compliance_review (CREDIT_NO_RECORD).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '6' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_simah_no_hit_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_simah_no_hit_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_simah_no_hit_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is requires_manual_compliance_review', () => pm.expect(body.decision).to.eql('requires_manual_compliance_review'));",
+                      "pm.test('Reasons: CREDIT_NO_RECORD', () => pm.expect(body.decisionReasons).to.have.members([\"CREDIT_NO_RECORD\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Amount above auto-processing limit",
+          "description": "requestedAmount 1500000 SAR. Expected: requires_manual_compliance_review (AMOUNT_ABOVE_AUTO_PROCESSING_LIMIT).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '0');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '0');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 1500000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_amount_above_limit_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_amount_above_limit_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_amount_above_limit_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is requires_manual_compliance_review', () => pm.expect(body.decision).to.eql('requires_manual_compliance_review'));",
+                      "pm.test('Reasons: AMOUNT_ABOVE_AUTO_PROCESSING_LIMIT', () => pm.expect(body.decisionReasons).to.have.members([\"AMOUNT_ABOVE_AUTO_PROCESSING_LIMIT\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Expired CR + Nafath down (rejection wins)",
+          "description": "nationalId ends in 4 (Nafath), crNumber ends in 1 (Wathiq). Expected: rejected (CR_EXPIRED).",
+          "item": [
+            {
+              "name": "Submit",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Idempotency-Key",
+                    "value": "{{idempotencyKey}}"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/applications",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"nationalId\": \"{{nationalId}}\",\n  \"crNumber\": \"{{crNumber}}\",\n  \"requestedAmount\": {{requestedAmount}}\n}",
+                  "options": {
+                    "raw": {
+                      "language": "json"
+                    }
+                  }
+                }
+              },
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Fresh identifiers on every run so an earlier, still-open application never causes a 409.",
+                      "// Scenario digits: Nafath = last digit of nationalId, SIMAH = second-to-last, Wathiq = last digit of crNumber.",
+                      "const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');",
+                      "pm.variables.set('nationalId', '1' + rnd(7) + '0' + '4');",
+                      "pm.variables.set('crNumber', '7' + rnd(8) + '1');",
+                      "pm.variables.set('idempotencyKey', pm.variables.replaceIn('{{$guid}}'));",
+                      "pm.variables.set('requestedAmount', 250000);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                      "pm.collectionVariables.set('scenario_reject_beats_review_id', pm.response.json().id);"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "name": "Result",
+              "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/applications/{{scenario_reject_beats_review_id}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "applications",
+                    "{{scenario_reject_beats_review_id}}"
+                  ]
+                },
+                "description": "Waits (up to pollTimeoutMs) until the application is decided, then shows it."
+              },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                      "const body = pm.response.json();",
+                      "pm.test('Decided', () => pm.expect(body.status).to.eql('decided'));",
+                      "pm.test('Decision is rejected', () => pm.expect(body.decision).to.eql('rejected'));",
+                      "pm.test('Reasons: CR_EXPIRED', () => pm.expect(body.decisionReasons).to.have.members([\"CR_EXPIRED\"]));"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Wait until the application is decided, so the response below shows the final result.",
+              "const target = pm.variables.replaceIn(pm.request.url.toString());",
+              "const deadline = Date.now() + Number(pm.variables.get('pollTimeoutMs') || 120000);",
+              "const poll = () =>",
+              "  pm.sendRequest(",
+              "    { url: target, method: 'GET', header: { Authorization: 'Bearer ' + pm.collectionVariables.get('accessToken') } },",
+              "    (err, res) => {",
+              "      if (!err && res.code === 200 && res.json().status === 'decided') return;",
+              "      if (err || res.code !== 200) return console.error('Polling failed', err || res.text());",
+              "      if (Date.now() > deadline) return console.warn('Still not decided after the poll timeout');",
+              "      setTimeout(poll, 2000);",
+              "    },",
+              "  );",
+              "if (pm.request.method === 'GET') poll();"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Mock gateways",
+      "description": "The stand-ins for Nafath/Yakeen, Wathiq and SIMAH that the pipeline calls. Not part of the product API; call them directly to see the raw provider responses. Change the last digits to try other scenarios.",
+      "item": [
+        {
+          "name": "List scenarios",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/mock/scenarios",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "mock",
+                "scenarios"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Lists all three providers', () => pm.expect(pm.response.json()).to.have.keys('nafath', 'wathiq', 'simah'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Nafath verify identity",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-Id",
+                "value": "{{$guid}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/mock/nafath/verify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "mock",
+                "nafath",
+                "verify"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nationalId\": \"1012345670\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('VERIFIED', () => pm.expect(pm.response.json().verificationStatus).to.eql('VERIFIED'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Wathiq CR status",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-Id",
+                "value": "{{$guid}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/mock/wathiq/cr-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "mock",
+                "wathiq",
+                "cr-status"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"crNumber\": \"7001234560\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('ACTIVE', () => pm.expect(pm.response.json().status).to.eql('ACTIVE'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Wathiq maintenance page (malformed)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-Id",
+                "value": "{{$guid}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/mock/wathiq/cr-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "mock",
+                "wathiq",
+                "cr-status"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"crNumber\": \"7001234565\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 with an HTML body instead of JSON', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.headers.get('Content-Type')).to.include('text/html');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "SIMAH credit report",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-Id",
+                "value": "{{$guid}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/mock/simah/credit-report",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "mock",
+                "simah",
+                "credit-report"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nationalId\": \"1012345670\",\n  \"crNumber\": \"7001234560\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Good score, no defaults', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.score).to.eql(720);",
+                  "  pm.expect(body.activeDefaults).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

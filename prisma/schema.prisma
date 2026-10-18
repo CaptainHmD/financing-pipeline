@@ -1,0 +1,109 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ApplicationStatus {
+  submitted // persisted, application.submitted event written to the outbox; no check has started yet
+  verifying // at least one check has started
+  decided // terminal
+}
+
+enum Decision {
+  approved_for_risk_assessment
+  rejected
+  requires_manual_compliance_review
+}
+
+enum CheckType {
+  identity // Nafath / Yakeen
+  commercial_registration // Wathiq
+  credit // SIMAH
+}
+
+enum CheckStatus {
+  pending
+  retrying // last attempt hit a transient failure, another attempt is scheduled
+  verified // definitive positive answer
+  failed // definitive negative answer (unverified ID, expired CR, ...)
+  ambiguous // provider answered but we could not interpret it safely
+  unavailable // retries exhausted on transient failures
+}
+
+model Application {
+  id              String            @id @default(uuid()) @db.Uuid
+  clientId        String
+  idempotencyKey  String
+  requestHash     String
+  nationalIdEnc   String
+  nationalIdHash  String
+  crNumberEnc     String
+  crNumberHash    String
+  requestedAmount Decimal           @db.Decimal(14, 2)
+  status          ApplicationStatus @default(submitted)
+  decision        Decision?
+  decisionReasons String[]          @default([])
+  decidedAt       DateTime?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  checks VerificationCheck[]
+  events AuditEvent[]
+
+  @@unique([clientId, idempotencyKey])
+  @@index([nationalIdHash, crNumberHash])
+  @@index([status, updatedAt])
+  @@map("applications")
+}
+
+model VerificationCheck {
+  id               String      @id @default(uuid()) @db.Uuid
+  applicationId    String      @db.Uuid
+  type             CheckType
+  status           CheckStatus @default(pending)
+  attempts         Int         @default(0)
+  reasonCode       String? // why the check ended failed/ambiguous/unavailable (e.g. CR_EXPIRED)
+  lastError        String? // last transient error seen (e.g. TIMEOUT, HTTP_503)
+  latencyMs        Int?
+  resultPayloadEnc String?
+  completedAt      DateTime?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, type])
+  @@map("verification_checks")
+}
+
+model AuditEvent {
+  id            BigInt   @id @default(autoincrement())
+  applicationId String   @db.Uuid
+  event         String
+  metadata      Json     @default("{}")
+  createdAt     DateTime @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId, createdAt])
+  @@map("audit_events")
+}
+
+/// Transactional outbox: written in the same transaction as the state change it announces,
+/// then published to RabbitMQ (immediately, or later by the worker's relay).
+model OutboxEvent {
+  id          String    @id @db.Uuid // also the AMQP messageId
+  routingKey  String
+  aggregateId String    @db.Uuid
+  payload     Json
+  attempts    Int       @default(0)
+  createdAt   DateTime  @default(now())
+  publishedAt DateTime?
+
+  @@index([publishedAt, createdAt])
+  @@map("outbox_events")
+}

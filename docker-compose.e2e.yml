@@ -1,0 +1,36 @@
+# Throwaway infrastructure for the e2e tests, isolated from the dev stack (own ports, no volumes).
+#   npm run e2e:up      start and wait until healthy
+#   npm run test:e2e    run the suite
+#   npm run e2e:down    remove everything
+name: app-e2e
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app_e2e
+    ports:
+      - '5433:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U app -d app_e2e']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: app
+    ports:
+      - '5673:5672'
+      - '15673:15672'
+    healthcheck:
+      # Run as the rabbitmq user (see docker-compose.yml)
+      test: ['CMD', 'su-exec', 'rabbitmq', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 3s
+      timeout: 5s
+      retries: 40
