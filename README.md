@@ -110,7 +110,7 @@ The e2e suite starts the real API and worker inside Jest, against their own data
 - dead-lettering
 - the circuit breaker opening and recovering
 
-**CI** (`.github/workflows/ci.yml`) runs on every push to `main` and on every pull request: Prettier check, lint, type check and build, unit tests, and e2e tests.
+**CI** (`.github/workflows/ci.yml`) runs on every push to `master` and on every pull request: Prettier check, lint, type check and build, unit tests, and e2e tests.
 
 ## Architecture
 
@@ -221,13 +221,13 @@ prisma/              schema and migrations
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `GET` | `/health` | – | Liveness probe |
-| `POST` | `/auth/token` | – | Demo client-credentials token (JWT, 15 min). Limited to 10 per minute. |
+| `GET` | `/health` | None | Liveness probe |
+| `POST` | `/auth/token` | None | Demo client-credentials token (JWT, 15 min). Limited to 10 per minute. |
 | `POST` | `/applications` | Bearer | Submit an application. Requires an `Idempotency-Key` header. Returns `202`. |
 | `GET` | `/applications/{id}` | Bearer | Status, decision, reasons and per-check results |
 | `GET` | `/applications/{id}/events` | Bearer | Audit trail |
-| `GET` | `/mock/scenarios` | – | Which digit triggers which mock behaviour |
-| `POST` | `/mock/nafath/verify` · `/mock/wathiq/cr-status` · `/mock/simah/credit-report` | – | The mock gateways |
+| `GET` | `/mock/scenarios` | None | Which digit triggers which mock behaviour |
+| `POST` | `/mock/nafath/verify` · `/mock/wathiq/cr-status` · `/mock/simah/credit-report` | None | The mock gateways |
 
 **Submit body:**
 - `nationalId`: 10 digits, starting with 1 (citizen) or 2 (Iqama).
@@ -284,7 +284,7 @@ A gateway being unavailable never rejects an applicant on its own. It sends the 
 | Worker crashes mid-check | Unacknowledged message | RabbitMQ redelivers; a check that's already final is skipped | Processed exactly once in effect |
 | Bug or database outage on the last attempt | Exception on the final delivery | The check is marked `unavailable` (`PROCESSING_ERROR`) so the application still gets decided | Manual review |
 | Unparseable message | JSON parse fails | Dead-lettered immediately to `financing.dead-letter` | No infinite loop; kept for inspection |
-| Duplicate `check.completed` | — | The decision is a compare-and-set transition | Exactly one decision |
+| Duplicate `check.completed` | Application already decided | The decision is a compare-and-set transition | Exactly one decision |
 | Client retries a submit | `Idempotency-Key` | Same key and body: the original is replayed. Different body: `409`. Concurrent duplicates are settled by a unique constraint. | No duplicate applications |
 | Second application while one is open | Blind-index lookup | `409` | One open application per National ID and CR |
 
@@ -340,6 +340,7 @@ The design leans towards SAMA's cyber security expectations and the Saudi Person
 - **Rules as configuration:** eligibility rules versioned in the database, with the rule version recorded on each decision.
 - **Auth:** OAuth2 client credentials from the platform's identity provider instead of the demo issuer, and scopes per endpoint.
 - **Load testing** of the submit path and of queue throughput under gateway outages.
+- **Delivery pipeline:** continuous deployment to Kubernetes. On each merge, build and push the API and worker images, then deploy them as separate Deployments (the worker autoscaled on queue depth), with migrations run as a pre-deploy Job and promotion from staging to production. Branch protection on `master` would block any merge whose CI checks fail. I left this out on purpose: for a prototype at this stage it would be over-engineering.
 
 ## AI usage
 
@@ -389,9 +390,9 @@ All variables are validated at startup (`src/shared/config/env.validation.ts`). 
 | `DATABASE_URL` | `postgresql://app:app@localhost:5432/app` | PostgreSQL (`sslmode=require` in production) |
 | `RABBITMQ_URL` | `amqp://app:app@localhost:5672` | RabbitMQ (`amqps://` in production) |
 | `RABBITMQ_PUBLISH_TIMEOUT_MS` | `2000` | How long a publish waits before the outbox relay takes over |
-| `JWT_SECRET`, `JWT_TTL_SECONDS` | –, `900` | Token signing key (at least 32 characters) and lifetime |
+| `JWT_SECRET`, `JWT_TTL_SECONDS` | required, `900` | Token signing key (at least 32 characters) and lifetime |
 | `ENABLE_DEMO_AUTH`, `DEMO_CLIENT_ID`, `DEMO_CLIENT_SECRET` | `true`, `demo-client`, `demo-client-secret` | Demo token endpoint (disable in production) |
-| `ENCRYPTION_KEY`, `BLIND_INDEX_KEY` | – | 32 bytes, base64 (`openssl rand -base64 32`) |
+| `ENCRYPTION_KEY`, `BLIND_INDEX_KEY` | required | 32 bytes, base64 (`openssl rand -base64 32`) |
 | `GATEWAY_BASE_URL` | `http://localhost:3001/mock` | Where the worker sends gateway calls |
 | `GATEWAY_TIMEOUT_MS`, `WATHIQ_TIMEOUT_MS` | `5000`, `3000` | Per-call timeouts |
 | `RETRY_ATTEMPTS`, `RETRY_BACKOFF_MS` | `5`, `2000` | Attempts per message, and the first delay (each later delay doubles) |
